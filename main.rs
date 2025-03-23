@@ -1,37 +1,63 @@
 // Se importan las librerías y módulos necesarios
-use teloxide::{prelude::*, utils::command::BotCommands};    // Librería para crear bots de Telegram
 use rust_decimal::prelude::*;                               // para trabajar con números decimales
 use serde::Deserialize;                                     // para deserializar (convertir) datos desde formato JSON
 use dotenv;                                                 // para cargar variables de entorno desde un archivo .env
 use pretty_env_logger;                                      // para gestionar el log con colores y formato bonito
 use log;                                                    // para registrar mensajes en el log
 
+// Importa los structs o enums para InlineKeyboardMarkup y InlineKeyboardButton
+use teloxide::{prelude::*, utils::command::BotCommands};    // Librería para crear bots de Telegram
+use teloxide::types::{WebAppInfo, InlineKeyboardMarkup, InlineKeyboardButton, Update, UpdateKind};
+use teloxide::update_listeners::Polling;
+use teloxide::update_listeners::AsUpdateStream;
+use futures_util::stream::StreamExt;
+use std::pin::Pin;
+
 // La función main es el punto de entrada del programa.
 // La anotación #[tokio::main] indica que se ejecutará en el runtime asíncrono de Tokio
 #[tokio::main]
 async fn main() {
-    // Carga las variables de entorno definidas en un archivo .env, si existe
+    // Carga las variables de entorno
     match dotenv::dotenv() {
-        Ok(_) => { 
-            println!("Archivo .env cargado correctamente."); 
-        }
-        Err(err) => { 
-            println!("No se encontró archivo .env. Se usarán las variables de entorno del sistema. Error: {:?}", err); 
-        }
+        Ok(_) => println!("Archivo .env cargado correctamente."),
+        Err(err) => println!("No se encontró archivo .env. Se usarán las variables de entorno del sistema. Error: {:?}", err),
     };
 
-    // Inicializa el logger para mostrar mensajes de debug/información en consola
+    // Inicializa el logger
     pretty_env_logger::init();
     log::info!("Starting command bot...");
 
     // Crea una instancia del bot usando el token almacenado en las variables de entorno
     let bot = Bot::from_env();
 
-    // Ejecuta el REPL (Read-Eval-Print Loop) para procesar comandos utilizando un closure
-    // Al recibir un comando, se llama a la función `answer`
-    Command::repl(bot, |bot, msg, cmd| async move {
+    // Listener para procesar los comandos
+    let bot_commands = bot.clone();
+    let commands_fut = Command::repl(bot_commands, |bot, msg, cmd| async move {
         answer(bot, msg, cmd).await
-    }).await;
+    });
+
+    // Listener para callback queries usando un update listener que es un Stream
+    let bot_callbacks = bot.clone();
+    let cb_fut = async move {
+        let mut polling = Polling::builder(bot_callbacks.clone())
+            .drop_pending_updates()
+            .timeout(std::time::Duration::from_secs(30))
+            .build();
+
+        let mut stream = Box::pin(polling.as_stream());
+        
+        while let Some(update_result) = stream.next().await {
+            if let Ok(update) = update_result {
+                if let Update { kind: UpdateKind::CallbackQuery(query), .. } = update {
+                    if let Err(err) = handle_callback_query(bot_callbacks.clone(), query).await {
+                        log::error!("Error in callback query handler: {:?}", err);
+                    }
+                }
+            }
+        }
+    };
+
+    tokio::join!(commands_fut, cb_fut);
 }
 
 // Se define una enumeración que representa los comandos que el bot soporta.
@@ -39,10 +65,21 @@ async fn main() {
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "These commands are supported:")]
 enum Command {
+    #[command(description = "About this bot.")]
+    Info,
     #[command(description = "Display this text.")]
     Help,
     #[command(description = "Get USDT/BTC price.")]
     GetBtcPrice,
+}
+
+pub enum MenuButton {
+    Commands,
+    WebApp {
+        text: String,
+        web_app: WebAppInfo,
+    },
+    Default,
 }
 
 // Se define una estructura para deserializar la respuesta del API.
@@ -56,21 +93,43 @@ struct PriceResponse {
 // Esta función procesa el comando recibido y envía la respuesta al usuario
 async fn answer(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
     match cmd { // Se evalúa qué comando fue recibido
+        Command::Info => {
+            // Envía un mensaje con la info del bot tomando las variables de entorno APP_NAME y APP_VERSION
+            bot.send_message(
+                msg.chat.id,
+                format!("Meow! Soy {}, en mi Version: {}. Solo puedo obtener el precio del Bitcoin por ahora. (BTC/USDT)",
+                    std::env::var("APP_NAME").unwrap_or("Bot".to_string()),
+                    std::env::var("APP_VERSION").unwrap_or("0.1".to_string())
+                ))
+            .await?
+        }
         Command::Help => {
             // Envía un mensaje de ayuda con la descripción de los comandos disponibles
             bot.send_message(msg.chat.id, Command::descriptions().to_string()).await?
         }
         Command::GetBtcPrice => {
-            // Llama a la función que obtiene el precio del bitcoin
+            // Define un botón con callback data "update_btc_price"
+            let keyboard = InlineKeyboardMarkup::default()
+                .append_row(vec![
+                    InlineKeyboardButton::callback("Update Price", "update_btc_price".to_string()),
+                ]);
+        
             match get_bitcoin_price().await {
                 Ok(val) => {
-                    // Se formatea el precio a 2 decimales y se envía al usuario
                     let price = format!("{:.2}", val);
-                    bot.send_message(msg.chat.id, format!("The price of the bitcoin is: {}", price)).await?
+                    // Envía el mensaje inicial con el precio y el teclado adjunto
+                    bot.send_message(
+                        msg.chat.id, 
+                        format!("The price of the bitcoin is: {}", price)
+                    )
+                    .reply_markup(keyboard)
+                    .await?
                 }
                 Err(err) => {
-                    // En caso de error, se informa al usuario
-                    bot.send_message(msg.chat.id, format!("Error fetching bitcoin price: {:?}", err)).await?
+                    bot.send_message(
+                        msg.chat.id, 
+                        format!("Error fetching bitcoin price: {:?}", err)
+                    ).await?
                 }
             }
         }
@@ -95,4 +154,33 @@ pub async fn get_bitcoin_price() -> Result<Decimal, Box<dyn std::error::Error + 
         }
     };
     Ok(price)
+}
+
+async fn handle_callback_query(bot: Bot, query: CallbackQuery) -> ResponseResult<()> {
+    if let Some(data) = &query.data {
+        if data == "update_btc_price" {
+            if let Some(message) = query.message {
+                // Clona el id de la callback para poder reutilizarlo
+                let callback_id = query.id.clone();
+                // Obtiene el precio actualizado
+                match get_bitcoin_price().await {
+                    Ok(val) => {
+                        let price = format!("{:.2}", val);
+                        // Edita el mensaje para actualizar el precio
+                        bot.edit_message_text(message.chat().id, message.id(), format!("The price of the bitcoin is: {}", price))
+                            .await?;
+                    }
+                    Err(err) => {
+                        // En caso de error, responde a la callback query
+                        bot.answer_callback_query(query.id.clone())
+                           .text(format!("Error fetching bitcoin price: {:?}", err))
+                           .await?;
+                    }
+                }
+                // Confirma la recepción de la callback query
+                bot.answer_callback_query(callback_id).await?;
+            }
+        }
+    }
+    Ok(())
 }
